@@ -1,7 +1,112 @@
-use std::fmt;
+ use std::fmt;
 use std::error::Error;
 
 use log::{info, warn, debug, error};
+
+pub mod spi;
+
+const PREAMBLE: u8 =    0x00;
+const STARTCODE1: u8 =  0x00;
+const STARTCODE2: u8 =  0xFF;
+const POSTAMBLE: u8 =   0x00;
+
+const HOSTTOPN532: u8 = 0xD4;
+const PN532TOHOST: u8 = 0xD5;
+
+// PN532 Commands
+const COMMAND_DIAGNOSE: u8 =                0x00;
+const COMMAND_GETFIRMWAREVERSION: u8 =      0x02;
+const COMMAND_GETGENERALSTATUS: u8 =        0x04;
+const COMMAND_READREGISTER: u8 =            0x06;
+const COMMAND_WRITEREGISTER: u8 =           0x08;
+const COMMAND_READGPIO: u8 =                0x0C;
+const COMMAND_WRITEGPIO: u8 =               0x0E;
+const COMMAND_SETSERIALBAUDRATE: u8 =       0x10;
+const COMMAND_SETPARAMETERS: u8 =           0x12;
+const COMMAND_SAMCONFIGURATION: u8 =        0x14;
+const COMMAND_POWERDOWN: u8 =               0x16;
+const COMMAND_RFCONFIGURATION: u8 =         0x32;
+const COMMAND_RFREGULATIONTEST: u8 =        0x58;
+const COMMAND_INJUMPFORDEP: u8 =            0x56;
+const COMMAND_INJUMPFORPSL: u8 =            0x46;
+const COMMAND_INLISTPASSIVETARGET: u8 =     0x4A;
+const COMMAND_INATR: u8 =                   0x50;
+const COMMAND_INPSL: u8 =                   0x4E;
+const COMMAND_INDATAEXCHANGE: u8 =          0x40;
+const COMMAND_INCOMMUNICATETHRU: u8 =       0x42;
+const COMMAND_INDESELECT: u8 =              0x44;
+const COMMAND_INRELEASE: u8 =               0x52;
+const COMMAND_INSELECT: u8 =                0x54;
+const COMMAND_INAUTOPOLL: u8 =              0x60;
+const COMMAND_TGINITASTARGET: u8 =          0x8C;
+const COMMAND_TGSETGENERALBYTES: u8 =       0x92;
+const COMMAND_TGGETDATA: u8 =               0x86;
+const COMMAND_TGSETDATA: u8 =               0x8E;
+const COMMAND_TGSETMETADATA: u8 =           0x94;
+const COMMAND_TGGETINITIATORCOMMAND: u8 =   0x88;
+const COMMAND_TGRESPONSETOINITIATOR: u8 =   0x90;
+const COMMAND_TGGETTARGETSTATUS: u8 =       0x8A;
+
+const RESPONSE_INDATAEXCHANGE: u8 =         0x41;
+const RESPONSE_INLISTPASSIVETARGET: u8 =    0x4B;
+
+const WAKEUP: u8 = 0x55;
+
+const MIFARE_ISO14443A: u8 = 0x00;
+
+// Mifare Commands
+const MIFARE_CMD_AUTH_A: u8 =           0x60;
+const MIFARE_CMD_AUTH_B: u8 =           0x61;
+const MIFARE_CMD_READ: u8 =             0x30;
+const MIFARE_CMD_WRITE: u8 =            0xA0;
+const MIFARE_CMD_TRANSFER: u8 =         0xB0;
+const MIFARE_CMD_DECREMENT: u8 =        0xC0;
+const MIFARE_CMD_INCREMENT: u8 =        0xC1;
+const MIFARE_CMD_STORE: u8 =            0xC2;
+const MIFARE_ULTRALIGHT_CMD_WRITE: u8 = 0xA2;
+
+// Prefixes for NDEF Records (to identify record type)
+const NDEF_URIPREFIX_NONE: u8 =         0x00;
+const NDEF_URIPREFIX_HTTP_WWWDOT: u8 =  0x01;
+const NDEF_URIPREFIX_HTTPS_WWWDOT: u8 = 0x02;
+const NDEF_URIPREFIX_HTTP: u8 =         0x03;
+const NDEF_URIPREFIX_HTTPS: u8 =        0x04;
+const NDEF_URIPREFIX_TEL: u8 =          0x05;
+const NDEF_URIPREFIX_MAILTO: u8 =       0x06;
+const NDEF_URIPREFIX_FTP_ANONAT: u8 =   0x07;
+const NDEF_URIPREFIX_FTP_FTPDOT: u8 =   0x08;
+const NDEF_URIPREFIX_FTPS: u8 =         0x09;
+const NDEF_URIPREFIX_SFTP: u8 =         0x0A;
+const NDEF_URIPREFIX_SMB: u8 =          0x0B;
+const NDEF_URIPREFIX_NFS: u8 =          0x0C;
+const NDEF_URIPREFIX_FTP: u8 =          0x0D;
+const NDEF_URIPREFIX_DAV: u8 =          0x0E;
+const NDEF_URIPREFIX_NEWS: u8 =         0x0F;
+const NDEF_URIPREFIX_TELNET: u8 =       0x10;
+const NDEF_URIPREFIX_IMAP: u8 =         0x11;
+const NDEF_URIPREFIX_RTSP: u8 =         0x12;
+const NDEF_URIPREFIX_URN: u8 =          0x13;
+const NDEF_URIPREFIX_POP: u8 =          0x14;
+const NDEF_URIPREFIX_SIP: u8 =          0x15;
+const NDEF_URIPREFIX_SIPS: u8 =         0x16;
+const NDEF_URIPREFIX_TFTP: u8 =         0x17;
+const NDEF_URIPREFIX_BTSPP: u8 =        0x18;
+const NDEF_URIPREFIX_BTL2CAP: u8 =      0x19;
+const NDEF_URIPREFIX_BTGOEP: u8 =       0x1A;
+const NDEF_URIPREFIX_TCPOBEX: u8 =      0x1B;
+const NDEF_URIPREFIX_IRDAOBEX: u8 =     0x1C;
+const NDEF_URIPREFIX_FILE: u8 =         0x1D;
+const NDEF_URIPREFIX_URN_EPC_ID: u8 =   0x1E;
+const NDEF_URIPREFIX_URN_EPC_TAG: u8 =  0x1F;
+const NDEF_URIPREFIX_URN_EPC_PAT: u8 =  0x20;
+const NDEF_URIPREFIX_URN_EPC_RAW: u8 =  0x21;
+const NDEF_URIPREFIX_URN_EPC: u8 =      0x22;
+const NDEF_URIPREFIX_URN_NFC: u8 =      0x23;
+
+const GPIO_VALIDATIONBIT: u8 = 0x80;
+
+const ACK: &[u8] = b"\x00\x00\xFF\x00\xFF\x00";
+const FRAME_START: &[u8] = b"\x00\x00\xFF";
 
 pub struct BusyError;
 
@@ -73,7 +178,9 @@ trait PN532 {
 
     fn wake_up(&self);
 
-    fn write_frame(&self);
+    fn write_frame(&self) {
+
+    }
 
     fn read_frame(&self);
 
