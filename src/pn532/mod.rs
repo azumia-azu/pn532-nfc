@@ -1,9 +1,9 @@
- use std::fmt;
+use core::panicking::panic;
+use std::fmt;
+use std::io;
 use std::error::Error;
 
 use log::{info, warn, debug, error};
-
-pub mod spi;
 
 const PREAMBLE: u8 =    0x00;
 const STARTCODE1: u8 =  0x00;
@@ -108,9 +108,26 @@ const GPIO_VALIDATIONBIT: u8 = 0x80;
 const ACK: &[u8] = b"\x00\x00\xFF\x00\xFF\x00";
 const FRAME_START: &[u8] = b"\x00\x00\xFF";
 
+#[derive(Debug)]
 pub struct BusyError;
 
+impl fmt::Display for BusyError {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        write!(f, "Busy Error!")
+    }
+}
+
 impl Error for BusyError { }
+
+#[derive(Debug)]
+pub struct RuntimeError(String);
+
+impl fmt::Display for RuntimeError {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        write!(f, "{}", &self.0)
+    } 
+}
+
 
 
 #[derive(Debug)]
@@ -121,7 +138,7 @@ pub struct PN532Error {
 
 impl PN532Error {
     fn error(code: usize) -> Self {
-        let msg = match self.code {
+        let msg = match code {
             0x01 => "PN532 ERROR TIMEOUT",
             0x02 => "PN532 ERROR CRC",
             0x03 => "PN532 ERROR PARITY",
@@ -150,6 +167,7 @@ impl PN532Error {
             0x2c => "PN532 ERROR MISMATCH",
             0x2d => "PN532 ERROR OVERCURRENT",
             0x2e => "PN532 ERROR NONAD",
+            _ => panic!("Error State: Unexpected PN532 Error Code: {}", code)
         }.to_owned();
 
         Self {
@@ -170,21 +188,66 @@ trait PN532 {
 
     fn reset(&self);
 
-    fn read_data(&self);
+    fn read_data(&self, len: usize) -> Vec<u8>;
 
-    fn write_data(&self);
+    fn write_data(&self, frame: &[u8]);
 
     fn wait_ready(&self);
 
     fn wake_up(&self);
 
-    fn write_frame(&self) {
+    fn write_frame(&self, data: &[u8]) {
+        assert!(data.len() > 1 && data.len() < 255);
 
+        let len = data.len() as u8;
+        let mut frame = vec![0_u8; (len+7) as usize];
+        frame[0] = PREAMBLE;
+        frame[1] = STARTCODE1;
+        frame[2] = STARTCODE2;
+        let mut checksum = sum(frame[0..3]);
+        frame[3] = len & 0xFF;
+        frame[4] = (!len + 1) & 0xFF;
+        frame[5..(len-2)].copy_from_slice(data);
+        checksum += sum(data);
+        frame[len-2] = !checksum & 0xFF;
+        frame[len-1] = POSTAMBLE;
+
+        debug!("Write frame: {:?}", frame);
+        self.write_data(&frame);
     }
 
-    fn read_frame(&self);
+    fn read_frame(&self, len: usize) -> Result<Vec<u8>, RuntimeError> {
+        let mut response = self.read_data(len + 7);
+        debug!("Read frame: {:?}", response);
 
-    fn call_function(&self);
+        let mut offset = 0_usize;
+        while response[offset] == 0x00 {
+            offset += 1;
+            if offset >= response.len() {
+                return Err(RuntimeError("Response frame preamble does not contain 0x00FF!".to_owned()));
+            }
+        }
+        if response[offset] != 0xFF { 
+            return Err(RuntimeError("Response frame preamble does not contain 0x00FF!".to_owned()));
+        }
+        offset += 1;
+        if offset >= response.len() {
+            return Err(RuntimeError("Response contains no data!".to_owned()));
+        }
+        
+        let frame_len = response[offset];
+        if (frame_len + response[offset + 1]) & 0xFF != 0 {
+            return Err(RuntimeError("Response length checksum did not match length!".to_owned()));
+        }
+        let checksum = sum(response[offset+2..offset+2+frame_len+1]) & 0xFF;
+        if checksum != 0 {
+            return Err(RuntimeError(format!("Response checksum did not match expected value: {}", checksum)));
+        }
+        
+        Ok(response[offset+2..offset+2+frame_len].into())
+    }
+
+    fn call_function(&self, command: u8, response_length: u8);
 
     fn get_firmware_version(&self);
 
