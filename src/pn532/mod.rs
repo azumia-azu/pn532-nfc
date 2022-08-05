@@ -2,8 +2,12 @@ use core::panicking::panic;
 use std::fmt;
 use std::io;
 use std::error::Error;
+use std::mem::transmute;
+use std::result;
 
 use log::{info, warn, debug, error};
+
+type Result<U> = result::Result<U, Box<dyn Error>>;
 
 const PREAMBLE: u8 =    0x00;
 const STARTCODE1: u8 =  0x00;
@@ -132,12 +136,12 @@ impl fmt::Display for RuntimeError {
 
 #[derive(Debug)]
 pub struct PN532Error {
-    code: usize,
+    code: u8,
     msg: String,
 }
 
 impl PN532Error {
-    fn error(code: usize) -> Self {
+    fn error(code: u8) -> Self {
         let msg = match code {
             0x01 => "PN532 ERROR TIMEOUT",
             0x02 => "PN532 ERROR CRC",
@@ -190,15 +194,24 @@ trait PN532 {
 
     fn read_data(&self, len: usize) -> Vec<u8>;
 
-    fn write_data(&self, frame: &[u8]);
+    fn write_data(&self, frame: &[u8]) -> Result<()>;
 
     fn wait_ready(&self);
 
     fn wake_up(&self);
 
-    fn write_frame(&self, data: &[u8]) {
+    /// Write a frame to the PN532 with the specified data bytearray.
+    fn write_frame(&self, data: &[u8]) -> Result<()> {
         assert!(data.len() > 1 && data.len() < 255);
 
+        // Build frame to send as:
+        // - Preamble (0x00)
+        // - Start code  (0x00, 0xFF)
+        // - Command length (1 byte)
+        // - Command length checksum
+        // - Command bytes
+        // - Checksum
+        // - Postamble (0x00)
         let len = data.len() as u8;
         let mut frame = vec![0_u8; (len+7) as usize];
         frame[0] = PREAMBLE;
@@ -213,53 +226,220 @@ trait PN532 {
         frame[len-1] = POSTAMBLE;
 
         debug!("Write frame: {:?}", frame);
-        self.write_data(&frame);
+        self.write_data(&frame)?;
+
+        Ok(())
     }
 
-    fn read_frame(&self, len: usize) -> Result<Vec<u8>, RuntimeError> {
+    /// Read a response frame from the PN532 of at most length bytes in size.
+    /// Returns the data inside the frame if found, otherwise raises an exception
+    /// if there is an error parsing the frame.  Note that less than length bytes
+    /// might be returned!
+    fn read_frame(&self, len: usize) -> Result<Vec<u8>> {
+
+        // Read frame with expected length of data.
         let mut response = self.read_data(len + 7);
         debug!("Read frame: {:?}", response);
 
+        // Swallow all the 0x00 values that preceed 0xFF.
         let mut offset = 0_usize;
         while response[offset] == 0x00 {
             offset += 1;
             if offset >= response.len() {
-                return Err(RuntimeError("Response frame preamble does not contain 0x00FF!".to_owned()));
+                return Err(box RuntimeError("Response frame preamble does not contain 0x00FF!".to_owned()));
             }
         }
         if response[offset] != 0xFF { 
-            return Err(RuntimeError("Response frame preamble does not contain 0x00FF!".to_owned()));
+            return Err(box RuntimeError("Response frame preamble does not contain 0x00FF!".to_owned()));
         }
         offset += 1;
         if offset >= response.len() {
-            return Err(RuntimeError("Response contains no data!".to_owned()));
+            return Err(box RuntimeError("Response contains no data!".to_owned()));
         }
-        
+        // Check length & length checksum match.
         let frame_len = response[offset];
         if (frame_len + response[offset + 1]) & 0xFF != 0 {
-            return Err(RuntimeError("Response length checksum did not match length!".to_owned()));
+            return Err(box RuntimeError("Response length checksum did not match length!".to_owned()));
         }
+        // Check frame checksum value matches bytes.
         let checksum = sum(response[offset+2..offset+2+frame_len+1]) & 0xFF;
         if checksum != 0 {
-            return Err(RuntimeError(format!("Response checksum did not match expected value: {}", checksum)));
+            return Err(box RuntimeError(format!("Response checksum did not match expected value: {}", checksum)));
         }
-        
+        // Return frame data.
         Ok(response[offset+2..offset+2+frame_len].into())
     }
 
-    fn call_function(&self, command: u8, response_length: u8);
+    /// Send specified command to the PN532 and expect up to response_length
+    /// bytes back in a response.  Note that less than the expected bytes might
+    /// be returned!  Params can optionally specify an array of bytes to send as
+    /// parameters to the function call.  Will wait up to timeout seconds
+    /// for a response and return a bytearray of response bytes, or None if no
+    /// response is available within the timeout.
+    fn call_function(&self, command: u8, response_length: usize, params: &[u8], timeout: f64) -> Result<Option<Vec<u8>>> {
 
-    fn get_firmware_version(&self);
+        // Build frame data with command and parameters.
+        let mut data = vec![0; 2 + params.len()];
+        data[0] = HOSTTOPN532;
+        data[1] = command & 0xFF;
 
-    fn SAM_configuration(&self);
+        data[2..2+params.len()].copy_from_slice(params);
+        debug!("Calling function.... send command: {}, by data: {:?}", command, data);
 
-    fn read_passive_target(&self);
+        // Send frame and wait for response.
+        if let Err(e) = self.write_frame(data.as_slice()) {
+            self.wake_up();
+            return Err(e);
+        }
+        if !self.wait_ready(timeout) {
+            return Ok(None);
+        }
+        // Verify ACK response and wait to be ready for function response.
+        if ACK != self.read_data(ACK.len()) {
+            return Err(box RuntimeError("Did not receive expected ACK from PN532!".to_owned()));
+        }
+        if !self.wait_ready(timeout) {
+            return Ok(None);
+        }
+        // Read response bytes.
+        let response = self.read_frame(response_length + 2)?;
+        debug!("called function success!.... response: {:?}", response);
+        // Check that response is for the called function.
+        if !(response[0] == PN532TOHOST && response[1] == (command + 1)) {
+            return Err(box RuntimeError("Received unexpected command response!".to_owned()));
+        }
 
-    fn mifare_classic_authenticate_block(&self);
+        // Return response data.
+        Ok(response[2..].into())
+    }
 
-    fn mifare_classic_read_block(&self);
+    /// Call PN532 GetFirmwareVersion function and return a tuple with the IC,
+    /// Ver, Rev, and Support values.
+    fn get_firmware_version(&self) -> Result<Vec<u8>> {
+        let response = self.call_function(COMMAND_GETFIRMWAREVERSION, 4, &[], 0.5)?;
+        match response {
+            Some(response) => Ok(response),
+            None => Err(box RuntimeError("Failed to detect the PN532".to_owned()))
+        }
+    }
 
-    fn mifare_classic_write_block(&self);
+    /// Configure the PN532 to read MiFare cards.
+    /// Send SAM configuration command with configuration for:
+    /// - 0x01, normal mode
+    /// - 0x14, timeout 50ms * 20 = 1 second
+    /// - 0x01, use IRQ pin
+    /// Note that no other verification is necessary as call_function will
+    /// check the command was executed as expected.
+    fn SAM_configuration(&self) -> Result<()> {
+        self.call_function(COMMAND_SAMCONFIGURATION, 0,&[0x01, 0x14, 0x01], 1.0)?;
+        Ok(())
+    }
+
+    /// Wait for a MiFare card to be available and return its UID when found.
+    /// Will wait up to timeout seconds and return None if no card is found,
+    /// otherwise a bytearray with the UID of the found card is returned.
+    fn read_passive_target(&self, card_baud: Option<u8>, timeout: f64) -> Result<Option<Vec<u8>>> {
+        // Send passive read command for 1 card.  Expect at most a 7 byte UUID.
+        let response = self.call_function(
+            COMMAND_INLISTPASSIVETARGET,
+            19,
+            &[0x01, card_baud.get_or(MIFARE_ISO14443A)],
+            timeout)?;
+        match response {
+            // If no response is available return None to indicate no card is present.
+            None => Ok(None),
+            Some(res) => {
+                // Check only 1 card with up to a 7 byte UID is present.
+                if response[0] != 0x01 {
+                    return Err(box RuntimeError("More than one card detected!".to_owned()));
+                }
+                if response[5] > 7 {
+                    return Err(box RuntimeError("Found card with unexpectedly long UID!".to_owned()));
+                }
+                // Return UID of card.
+                return Ok(res[6..6+response[5]].into());
+            }
+        }
+    }
+
+    /// Authenticate specified block number for a MiFare classic card.  Uid
+    /// should be a byte array with the UID of the card, block number should be
+    /// the block to authenticate, key number should be the key type (like
+    /// `MIFARE_CMD_AUTH_A` or `MIFARE_CMD_AUTH_B`), and key should be a byte array
+    /// with the key data.  Returns True if the block was authenticated, or False
+    /// if not authenticated.
+    fn mifare_classic_authenticate_block(&self, uid: &[u8], block_number: u8, key_number: u8, key: &[u8]) -> Result<bool> {
+
+        // Build parameters for InDataExchange command to authenticate MiFare card.
+        let uid_len = uid.len();
+        let key_len = key.len();
+        let mut params = vec![0; 3 + uid_len + key_len];
+        params[0] = 0x01; // Max card numbers
+        params[1] = key_number & 0xFF;
+        params[2] = block_number & 0xFF;
+        params[3..3+key_len].copy_from_slice(key);
+        params[3+key_len..].copy_from_slice(uid);
+
+        // Send InDataExchange request and verify response is 0x00.
+        let response = self.call_function(
+            COMMAND_INDATAEXCHANGE,
+            1,
+            params.into(),
+            1.0,
+        )?;
+
+        self.check_response(response)
+    }
+
+    /// Read a block of data from the card.  Block number should be the block
+    /// to read.  If the block is successfully read a bytearray of length 16 with
+    /// data starting at the specified block will be returned.  If the block is
+    /// not read then None will be returned.
+    fn mifare_classic_read_block(&self, block_number: u8) -> Result<Vec<u8>> {
+
+        // Send InDataExchange request to read block of MiFare data.
+        let response = self.call_function(
+            COMMAND_INDATAEXCHANGE,
+            17,
+            &[0x01, MIFARE_CMD_READ, block_number & 0xFF],
+            1.0
+        )?;
+
+        if let Some(res) = response {
+            // Check first response is 0x00 to show success.
+            if res[0] != 0 {
+                Err(box PN532Error::error(res[0]))
+            } else {
+                // Return first 4 bytes since 16 bytes are always returned.
+                Ok(res[1..].into())
+            }
+        } else {
+            Ok(vec![])
+        }
+    }
+
+    /// Write a block of data to the card.  Block number should be the block
+    /// to write and data should be a byte array of length 4 with the data to
+    /// write.  If the data is successfully written then True is returned,
+    /// otherwise False is returned.
+    fn mifare_classic_write_block(&self, block_number: u8, data: &[u8]) -> Result<bool> {
+        assert_eq!(data.len(), 16);
+
+        let mut params = vec![0; 19];
+        params[0] = 0x01;
+        params[1] = MIFARE_CMD_WRITE;
+        params[2] = block_number & 0xFF;
+        params[3..].copy_from_slice(data);
+
+        let response = self.call_function(
+            COMMAND_INDATAEXCHANGE,
+            1,
+            params.into(),
+            1.0
+        )?;
+
+        self.check_response(response)
+    }
 
     fn ntag2xx_write_block(&self);
     
@@ -271,4 +451,15 @@ trait PN532 {
 
     fn tg_init_as_target(&self);
 
+    fn check_response(&self, response: Option<Vec<u8>>) -> Result<bool> {
+        if let Some(res) = response {
+            if response[0] != 0x00 {
+                Err(box PN532Error::error(res[0]))
+            } else {
+                Ok(true)
+            }
+        } else {
+            Ok(false)
+        }
+    }
 }
