@@ -1,9 +1,7 @@
-use core::panicking::panic;
 use std::fmt;
-use std::io;
 use std::error::Error;
-use std::mem::transmute;
 use std::result;
+use std::rt::panic_display;
 
 use log::{info, warn, debug, error};
 
@@ -112,6 +110,46 @@ const GPIO_VALIDATIONBIT: u8 = 0x80;
 const ACK: &[u8] = b"\x00\x00\xFF\x00\xFF\x00";
 const FRAME_START: &[u8] = b"\x00\x00\xFF";
 
+pub enum PN532Gpio {
+    P30,
+    P31,
+    P32,
+    P33,
+    P34,
+    P35,
+    P71,
+    P72,
+    I0,
+    I1
+}
+
+impl PN532Gpio {
+    fn idx(&self) -> usize {
+        match self {
+            PN532Gpio::P30 | PN532Gpio::P31 | PN532Gpio::P32 |
+            PN532Gpio::P33 | PN532Gpio::P34 | PN532Gpio::P35 => 0,
+            PN532Gpio::P71 | PN532Gpio::P72 => 1,
+            PN532Gpio::I0 | PN532Gpio::I1 => 2,
+        }
+    }
+
+    fn get(&self, response: u8) -> bool {
+        response >> self.offset() & 1 == 1
+    }
+
+    fn offset(&self) -> u8 {
+         match self {
+            PN532Gpio::P30 | PN532Gpio::I0 => 0,
+            PN532Gpio::P31 | PN532Gpio::P71 | PN532Gpio::I1 => 1,
+            PN532Gpio::P32 | PN532Gpio::P72 => 2,
+            PN532Gpio::P33 => 3,
+            PN532Gpio::P34 => 4,
+            PN532Gpio::P35 => 5,
+        }
+    }
+
+}
+
 #[derive(Debug)]
 pub struct BusyError;
 
@@ -132,6 +170,7 @@ impl fmt::Display for RuntimeError {
     } 
 }
 
+impl Error for RuntimeError {}
 
 
 #[derive(Debug)]
@@ -187,6 +226,8 @@ impl fmt::Display for PN532Error {
     }
 }
 
+impl Error for PN532Error {}
+
 trait PN532 {
     fn gpio_init(&self);
 
@@ -196,7 +237,7 @@ trait PN532 {
 
     fn write_data(&self, frame: &[u8]) -> Result<()>;
 
-    fn wait_ready(&self);
+    fn wait_ready(&self, timeout: f64) -> bool;
 
     fn wake_up(&self);
 
@@ -217,13 +258,13 @@ trait PN532 {
         frame[0] = PREAMBLE;
         frame[1] = STARTCODE1;
         frame[2] = STARTCODE2;
-        let mut checksum = sum(frame[0..3]);
+        let mut checksum: u8 = frame[0..3].iter().sum();
         frame[3] = len & 0xFF;
         frame[4] = (!len + 1) & 0xFF;
-        frame[5..(len-2)].copy_from_slice(data);
-        checksum += sum(data);
-        frame[len-2] = !checksum & 0xFF;
-        frame[len-1] = POSTAMBLE;
+        frame[5..(len as usize -2)].copy_from_slice(data);
+        checksum += data.iter().sum::<u8>();
+        frame[len as usize -2] = !checksum & 0xFF;
+        frame[len as usize -1] = POSTAMBLE;
 
         debug!("Write frame: {:?}", frame);
         self.write_data(&frame)?;
@@ -238,7 +279,7 @@ trait PN532 {
     fn read_frame(&self, len: usize) -> Result<Vec<u8>> {
 
         // Read frame with expected length of data.
-        let mut response = self.read_data(len + 7);
+        let response = self.read_data(len + 7);
         debug!("Read frame: {:?}", response);
 
         // Swallow all the 0x00 values that preceed 0xFF.
@@ -262,12 +303,12 @@ trait PN532 {
             return Err(box RuntimeError("Response length checksum did not match length!".to_owned()));
         }
         // Check frame checksum value matches bytes.
-        let checksum = sum(response[offset+2..offset+2+frame_len+1]) & 0xFF;
+        let checksum: u8 = response[offset+2..offset+2+(frame_len as usize)+1].iter().sum::<u8>() & 0xFF;
         if checksum != 0 {
             return Err(box RuntimeError(format!("Response checksum did not match expected value: {}", checksum)));
         }
         // Return frame data.
-        Ok(response[offset+2..offset+2+frame_len].into())
+        Ok(response[offset+2..offset+2+(frame_len as usize)].into())
     }
 
     /// Send specified command to the PN532 and expect up to response_length
@@ -310,7 +351,7 @@ trait PN532 {
         }
 
         // Return response data.
-        Ok(response[2..].into())
+        Ok(Some(response[2..].to_owned()))
     }
 
     /// Call PN532 GetFirmwareVersion function and return a tuple with the IC,
@@ -343,21 +384,21 @@ trait PN532 {
         let response = self.call_function(
             COMMAND_INLISTPASSIVETARGET,
             19,
-            &[0x01, card_baud.get_or(MIFARE_ISO14443A)],
+            &[0x01, card_baud.unwrap_or(MIFARE_ISO14443A)],
             timeout)?;
         match response {
             // If no response is available return None to indicate no card is present.
             None => Ok(None),
             Some(res) => {
                 // Check only 1 card with up to a 7 byte UID is present.
-                if response[0] != 0x01 {
+                if res[0] != 0x01 {
                     return Err(box RuntimeError("More than one card detected!".to_owned()));
                 }
-                if response[5] > 7 {
+                if res[5] > 7 {
                     return Err(box RuntimeError("Found card with unexpectedly long UID!".to_owned()));
                 }
                 // Return UID of card.
-                return Ok(res[6..6+response[5]].into());
+                return Ok(Some(res[6..6+(res[5] as usize)].to_owned()));
             }
         }
     }
@@ -384,7 +425,7 @@ trait PN532 {
         let response = self.call_function(
             COMMAND_INDATAEXCHANGE,
             1,
-            params.into(),
+            params.as_slice(),
             1.0,
         )?;
 
@@ -434,26 +475,174 @@ trait PN532 {
         let response = self.call_function(
             COMMAND_INDATAEXCHANGE,
             1,
-            params.into(),
+            params.as_slice(),
             1.0
         )?;
 
         self.check_response(response)
     }
 
-    fn ntag2xx_write_block(&self);
+    fn ntag2xx_write_block(&self, block_number: u8, data: &[u8]) -> Result<bool> {
+        assert_eq!(data.len(), 4);
+
+        let mut params = vec![0; 3+data.len()];
+        params[0] = 0x01;
+        params[1] = MIFARE_ULTRALIGHT_CMD_WRITE;
+        params[2] = block_number & 0xFF;
+        params[3..].copy_from_slice(data);
+
+        let response = self.call_function(
+            COMMAND_INDATAEXCHANGE,
+            1,
+            params.as_slice(),
+            1.0
+        )?;
+
+        self.check_response(response)
+    }
     
-    fn ntag2xx_read_block(&self);
+    fn ntag2xx_read_block(&self, block_number: u8) -> Result<Vec<u8>>{
+        self.mifare_classic_read_block(block_number)
+            .and_then(| res | {Ok(res[..4].to_owned())})
+    }
 
-    fn read_gpio(&self);
+    /// Read the state of the PN532's GPIO pins.
+    /// If `pin` is None, returns 3 bytes containing the pin state as `(None, Vec<u7>)`
+    /// where:
+    /// ```
+    /// P3[0] = P30,   P7[0] = 0,   I[0] = I0,
+    /// P3[1] = P31,   P7[1] = P71, I[1] = I1,
+    /// P3[2] = P32,   P7[2] = P72, I[2] = 0,
+    /// P3[3] = P33,   P7[3] = 0,   I[3] = 0,
+    /// P3[4] = P34,   P7[4] = 0,   I[4] = 0,
+    /// P3[5] = P35,   P7[5] = 0,   I[5] = 0,
+    /// P3[6] = 0,     P7[6] = 0,   I[6] = 0,
+    /// P3[7] = 0,     P7[7] = 0,   I[7] = 0,
+    /// ```
+    /// If `pin` is not None, returns the specified pin state as `(Bool, None)`
+    fn read_gpio(&self, pin: Option<PN532Gpio>) -> Result<(Option<bool>, Option<Vec<u8>>)> {
+        let response = self.call_function(
+            COMMAND_READGPIO,
+            3,
+            &[],
+            1.0
+        )?.unwrap();
+        info!("GPIO Status: {:?}", response);
 
-    fn write_gpio(&self);
+        match pin {
+            Some(pin) => {
+                Ok((Some(pin.get(response[pin.idx()])), None))
+            }
+            None => Ok((None, Some(response[..3].to_owned())))
+        }
+    }
 
-    fn tg_init_as_target(&self);
+    /// Write the state to the PN532's GPIO pins.
+    /// If p3 or p7 is not `None`, set the pins with p3 or p7, there is
+    /// no need to read pin states before write with the param p3 or p7
+    /// bits:
+    /// ```
+    /// P3[0] = P30,   P7[0] = 0,
+    /// P3[1] = P31,   P7[1] = P71,
+    /// P3[2] = P32,   P7[2] = P72,
+    /// P3[3] = P33,   P7[3] = nu,
+    /// P3[4] = P34,   P7[4] = nu,
+    /// P3[5] = P35,   P7[5] = nu,
+    /// P3[6] = nu,    P7[6] = nu,
+    /// P3[7] = Val,   P7[7] = Val,
+    /// ```
+    /// For each port that is validated (bit Val = 1), all the bits are applied
+    /// simultaneously. It is not possible for example to modify the state of
+    /// the port P32 without applying a value to the ports P30, P31, P33, P34
+    /// and P35.
+    ///
+    /// If p3 and p7 are `None`, set one pin with the params 'pin' and 'state'
+    fn write_gpio(&self, pin: PN532Gpio, state: bool, p3: Option<u8>, p7: Option<u8>) -> Result<()> {
+        let mut params = [0x00; 2];
+        if let (Some(p3), Some(p7)) = (p3, p7) {
+            params[0] = if p3 == 0 { 0x00 } else { 0x80 | p3 & 0xFF };
+            params[1] = if p7 == 0 { 0x00 } else { 0x80 | p7 & 0xFF };
+            self.call_function(
+                COMMAND_WRITEGPIO,
+                1,
+                &params,
+                1.0
+            ).map(||())
+        } else {
+            match pin {
+                PN532Gpio::I0 | PN532Gpio::I1 => Ok(()),
+                _ => {
+                    let response = self.read_gpio(None)?.1.unwrap();
+                    params[pin.idx()] = if state {
+                        0x80 | response[pin.idx()] | (1 << pin.offset()) & 0xFF
+                    } else {
+                        0x80 | response[pin.idx()] & !(1 << pin.offset()) & 0xFF
+                    };
+
+                    self.call_function(
+                        COMMAND_WRITEGPIO,
+                        1,
+                        &params,
+                        1.0
+                    )
+                }
+            }
+        }
+    }
+
+    /// The host controller uses this command to configure the PN532 as
+    /// target.
+    /// :params mode: a byte indicating which mode the PN532 should respect.
+    /// :params mifare_params: information needed to be able to be
+    /// activated at 106 kbps in passive mode.
+    /// :params felica_params: information to be able to respond to a polling
+    /// request at 212/424 kbps in passive mode.
+    /// :params nfcid3t: used in the ATR_RES in case of ATR_REQ received from
+    /// the initiator
+    /// :params gt: an array containing the general bytes to be used in the
+    /// ATR_RES. This information is optional and the length is not fixed
+    /// (max. 47 bytes),
+    /// :params tk: an array containing the historical bytes to be used in the
+    /// ATS when PN532 is in ISO/IEC14443-4 PICC emulation mode. This
+    /// information is optional.
+    /// :returns mode: a byte indicating in which mode the PN532 has been
+    /// activated.
+    /// :returns initiator_command: an array containing the first valid frame
+    /// received by the PN532 once the PN532 has been initialized.
+    fn tg_init_as_target(&self, mode: u8,
+                         mifare_params: [u8; 6], felica_params: [u8; 18], nfcid3t: [u8; 10],
+                         gt: Option<&[u8]>, tk: Option<&[u8]>, timeout: f64) -> Result<Option<(u8, Vec<u8>)>> {
+        let mut params = Vec::new();
+        params.push(mode);
+        params.extend_from_slice(&mifare_params);
+        params.extend_from_slice(&felica_params);
+        params.extend_from_slice(&nfcid3t);
+        let push_slice = | &mut params, slice: Option<&[u8]> | {
+            if let Some(slice) = slice {
+                params.push(slice.len() as u8);
+                params.extend_from_slice(slice);
+            } else { params.push(0x00) }
+        };
+        push_slice(&mut params, gt);
+        push_slice(&mut params, tk);
+
+        let response = self.call_function(
+            COMMAND_TGINITASTARGET,
+            64,
+            params.as_slice(),
+            timeout
+        )?;
+        // Try to read 64 bytes although the response length is not fixed
+        if let Some(response) = response {
+            Ok(Some((response[0], response[1..].to_owned())))
+        } else {
+            Ok(None)
+        }
+    }
 
     fn check_response(&self, response: Option<Vec<u8>>) -> Result<bool> {
         if let Some(res) = response {
-            if response[0] != 0x00 {
+            if res[0] != 0x00 {
                 Err(box PN532Error::error(res[0]))
             } else {
                 Ok(true)
