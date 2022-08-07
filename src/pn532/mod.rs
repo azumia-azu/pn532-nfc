@@ -5,6 +5,8 @@ use std::rt::panic_display;
 
 use log::{info, warn, debug, error};
 
+pub mod spi;
+
 type Result<U> = result::Result<U, Box<dyn Error>>;
 
 const PREAMBLE: u8 =    0x00;
@@ -231,7 +233,7 @@ impl Error for PN532Error {}
 trait PN532 {
     fn gpio_init(&self);
 
-    fn reset(&self);
+    fn reset(&self, pin: u8);
 
     fn read_data(&self, len: usize) -> Vec<u8>;
 
