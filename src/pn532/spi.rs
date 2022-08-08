@@ -3,7 +3,6 @@ use std::thread;
 use std::time::{Duration, Instant};
 use rppal::spi::{Bus, SlaveSelect, Mode, Spi};
 use rppal::gpio::Gpio;
-use rppal::uart::Error::Gpio;
 use crate::pn532::PN532;
 
 const SPI_STATREAD: u8 =    0x02;
@@ -14,17 +13,24 @@ const SPI_READY: u8 =       0x01;
 struct PN532Spi {
     spi: Spi,
     gpio: Gpio,
+    cs: Option<u8>,
+    irq: Option<u8>
 }
 
 impl PN532Spi {
-    fn new(cs: u32) -> Self {
+    fn new(cs: Option<u8>, irq: Option<u8>) -> crate::pn532::Result<Self> {
         let spi =
-            Spi::new(Bus::Spi0, SlaveSelect::Ss0, cs, Mode::Mode2)?;
+            Spi::new(Bus::Spi0, SlaveSelect::Ss0, 1_000_000, Mode::Mode2)?;
         let gpio = Gpio::new()?;
-        Self {
-            spi,
-            gpio
+        if let Some(pin) = cs {
+            gpio.get(pin)?.into_output_high();
         }
+        Ok(Self {
+            spi,
+            gpio,
+            cs,
+            irq
+        })
     }
 }
 
@@ -68,6 +74,13 @@ impl PN532 for PN532Spi {
         false
     }
 
-    fn wake_up(&self) {
+    fn wake_up(&mut self) {
+        thread::sleep(Duration::from_secs(1));
+        if let Some(pin) = self.cs {
+            self.gpio.get(pin)?.into_output_low();
+        }
+        thread::sleep(Duration::from_millis(2));
+        self.spi.write(&[0x00])?;
+        thread::sleep(Duration::from_secs(1))
     }
 }

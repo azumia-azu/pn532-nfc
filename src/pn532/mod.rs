@@ -231,6 +231,18 @@ impl fmt::Display for PN532Error {
 impl Error for PN532Error {}
 
 trait PN532 {
+    fn init(&self, reset: Option<u8>) -> Result<()> {
+        if let Some(pin) = reset {
+            debug!("Resetting!");
+            self.reset(pin);
+        }
+
+        self.wake_up();
+        self.get_firmware_version()?;
+
+        Ok(())
+    }
+
     fn gpio_init(&self);
 
     fn reset(&self, pin: u8);
