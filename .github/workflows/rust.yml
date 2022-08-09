@@ -11,9 +11,11 @@ env:
 
 jobs:
   build:
-
     runs-on: ubuntu-latest
-
+    strategy:
+      matrix:
+        target: aarch64-unknown-linux-gnu
+        
     steps:
     - uses: actions/checkout@v3
     - name: Add Target
@@ -23,6 +25,6 @@ jobs:
     - name: Switch to Nightly Channel
       run: rustup default nightly
     - name: Build
-      run: cargo build --verbose
+      run: cargo build --target ${{ matrix.target }} --verbose
     - name: Run tests
       run: cargo test --verbose
