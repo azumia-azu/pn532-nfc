@@ -1,9 +1,8 @@
 use std::fmt;
 use std::error::Error;
 use std::result;
-use std::rt::panic_display;
 
-use log::{info, warn, debug, error};
+use log::{info, debug};
 
 pub mod spi;
 
@@ -231,32 +230,32 @@ impl fmt::Display for PN532Error {
 impl Error for PN532Error {}
 
 trait PN532 {
-    fn init(&self, reset: Option<u8>) -> Result<()> {
+    fn init(&mut self, reset: Option<u8>) -> Result<()> {
         if let Some(pin) = reset {
             debug!("Resetting!");
-            self.reset(pin);
+            self.reset(pin)?;
         }
 
-        self.wake_up();
+        self.wake_up()?;
         self.get_firmware_version()?;
 
         Ok(())
     }
 
-    fn gpio_init(&self);
+    fn gpio_init(&self, ) -> Result<()>;
 
-    fn reset(&self, pin: u8);
+    fn reset(&self, pin: u8) -> Result<()>;
 
-    fn read_data(&self, len: usize) -> Vec<u8>;
+    fn read_data(&mut self, len: usize) -> Result<Vec<u8>>;
 
-    fn write_data(&self, frame: &[u8]) -> Result<()>;
+    fn write_data(&mut self, frame: &[u8]) -> Result<()>;
 
-    fn wait_ready(&self, timeout: f64) -> bool;
+    fn wait_ready(&mut self, timeout: f64) -> Result<bool>;
 
-    fn wake_up(&self);
+    fn wake_up(&mut self) -> Result<()>;
 
     /// Write a frame to the PN532 with the specified data bytearray.
-    fn write_frame(&self, data: &[u8]) -> Result<()> {
+    fn write_frame(&mut self, data: &[u8]) -> Result<()> {
         assert!(data.len() > 1 && data.len() < 255);
 
         // Build frame to send as:
@@ -273,11 +272,11 @@ trait PN532 {
         frame[1] = STARTCODE1;
         frame[2] = STARTCODE2;
         let mut checksum: u8 = frame[0..3].iter().sum();
-        frame[3] = len & 0xFF;
-        frame[4] = (!len + 1) & 0xFF;
+        frame[3] = len;
+        frame[4] = !len + 1;
         frame[5..(len as usize -2)].copy_from_slice(data);
         checksum += data.iter().sum::<u8>();
-        frame[len as usize -2] = !checksum & 0xFF;
+        frame[len as usize -2] = !checksum;
         frame[len as usize -1] = POSTAMBLE;
 
         debug!("Write frame: {:?}", frame);
@@ -290,10 +289,10 @@ trait PN532 {
     /// Returns the data inside the frame if found, otherwise raises an exception
     /// if there is an error parsing the frame.  Note that less than length bytes
     /// might be returned!
-    fn read_frame(&self, len: usize) -> Result<Vec<u8>> {
+    fn read_frame(&mut self, len: usize) -> Result<Vec<u8>> {
 
         // Read frame with expected length of data.
-        let response = self.read_data(len + 7);
+        let response = self.read_data(len + 7)?;
         debug!("Read frame: {:?}", response);
 
         // Swallow all the 0x00 values that preceed 0xFF.
@@ -313,11 +312,11 @@ trait PN532 {
         }
         // Check length & length checksum match.
         let frame_len = response[offset];
-        if (frame_len + response[offset + 1]) & 0xFF != 0 {
+        if (frame_len + response[offset + 1]) != 0 {
             return Err(box RuntimeError("Response length checksum did not match length!".to_owned()));
         }
         // Check frame checksum value matches bytes.
-        let checksum: u8 = response[offset+2..offset+2+(frame_len as usize)+1].iter().sum::<u8>() & 0xFF;
+        let checksum: u8 = response[offset+2..offset+2+(frame_len as usize)+1].iter().sum::<u8>();
         if checksum != 0 {
             return Err(box RuntimeError(format!("Response checksum did not match expected value: {}", checksum)));
         }
@@ -331,29 +330,29 @@ trait PN532 {
     /// parameters to the function call.  Will wait up to timeout seconds
     /// for a response and return a bytearray of response bytes, or None if no
     /// response is available within the timeout.
-    fn call_function(&self, command: u8, response_length: usize, params: &[u8], timeout: f64) -> Result<Option<Vec<u8>>> {
+    fn call_function(&mut self, command: u8, response_length: usize, params: &[u8], timeout: f64) -> Result<Option<Vec<u8>>> {
 
         // Build frame data with command and parameters.
         let mut data = vec![0; 2 + params.len()];
         data[0] = HOSTTOPN532;
-        data[1] = command & 0xFF;
+        data[1] = command;
 
         data[2..2+params.len()].copy_from_slice(params);
         debug!("Calling function.... send command: {}, by data: {:?}", command, data);
 
         // Send frame and wait for response.
         if let Err(e) = self.write_frame(data.as_slice()) {
-            self.wake_up();
+            self.wake_up()?;
             return Err(e);
         }
-        if !self.wait_ready(timeout) {
+        if !self.wait_ready(timeout)? {
             return Ok(None);
         }
         // Verify ACK response and wait to be ready for function response.
-        if ACK != self.read_data(ACK.len()) {
+        if ACK != self.read_data(ACK.len())? {
             return Err(box RuntimeError("Did not receive expected ACK from PN532!".to_owned()));
         }
-        if !self.wait_ready(timeout) {
+        if !self.wait_ready(timeout)? {
             return Ok(None);
         }
         // Read response bytes.
@@ -370,7 +369,7 @@ trait PN532 {
 
     /// Call PN532 GetFirmwareVersion function and return a tuple with the IC,
     /// Ver, Rev, and Support values.
-    fn get_firmware_version(&self) -> Result<Vec<u8>> {
+    fn get_firmware_version(&mut self) -> Result<Vec<u8>> {
         let response = self.call_function(COMMAND_GETFIRMWAREVERSION, 4, &[], 0.5)?;
         match response {
             Some(response) => Ok(response),
@@ -385,7 +384,7 @@ trait PN532 {
     /// - 0x01, use IRQ pin
     /// Note that no other verification is necessary as call_function will
     /// check the command was executed as expected.
-    fn SAM_configuration(&self) -> Result<()> {
+    fn SAM_configuration(&mut self) -> Result<()> {
         self.call_function(COMMAND_SAMCONFIGURATION, 0,&[0x01, 0x14, 0x01], 1.0)?;
         Ok(())
     }
@@ -393,7 +392,7 @@ trait PN532 {
     /// Wait for a MiFare card to be available and return its UID when found.
     /// Will wait up to timeout seconds and return None if no card is found,
     /// otherwise a bytearray with the UID of the found card is returned.
-    fn read_passive_target(&self, card_baud: Option<u8>, timeout: f64) -> Result<Option<Vec<u8>>> {
+    fn read_passive_target(&mut self, card_baud: Option<u8>, timeout: f64) -> Result<Option<Vec<u8>>> {
         // Send passive read command for 1 card.  Expect at most a 7 byte UUID.
         let response = self.call_function(
             COMMAND_INLISTPASSIVETARGET,
@@ -412,7 +411,7 @@ trait PN532 {
                     return Err(box RuntimeError("Found card with unexpectedly long UID!".to_owned()));
                 }
                 // Return UID of card.
-                return Ok(Some(res[6..6+(res[5] as usize)].to_owned()));
+                Ok(Some(res[6..6+(res[5] as usize)].to_owned()))
             }
         }
     }
@@ -423,15 +422,15 @@ trait PN532 {
     /// `MIFARE_CMD_AUTH_A` or `MIFARE_CMD_AUTH_B`), and key should be a byte array
     /// with the key data.  Returns True if the block was authenticated, or False
     /// if not authenticated.
-    fn mifare_classic_authenticate_block(&self, uid: &[u8], block_number: u8, key_number: u8, key: &[u8]) -> Result<bool> {
+    fn mifare_classic_authenticate_block(&mut self, uid: &[u8], block_number: u8, key_number: u8, key: &[u8]) -> Result<bool> {
 
         // Build parameters for InDataExchange command to authenticate MiFare card.
         let uid_len = uid.len();
         let key_len = key.len();
         let mut params = vec![0; 3 + uid_len + key_len];
         params[0] = 0x01; // Max card numbers
-        params[1] = key_number & 0xFF;
-        params[2] = block_number & 0xFF;
+        params[1] = key_number;
+        params[2] = block_number;
         params[3..3+key_len].copy_from_slice(key);
         params[3+key_len..].copy_from_slice(uid);
 
@@ -450,13 +449,13 @@ trait PN532 {
     /// to read.  If the block is successfully read a bytearray of length 16 with
     /// data starting at the specified block will be returned.  If the block is
     /// not read then None will be returned.
-    fn mifare_classic_read_block(&self, block_number: u8) -> Result<Vec<u8>> {
+    fn mifare_classic_read_block(&mut self, block_number: u8) -> Result<Vec<u8>> {
 
         // Send InDataExchange request to read block of MiFare data.
         let response = self.call_function(
             COMMAND_INDATAEXCHANGE,
             17,
-            &[0x01, MIFARE_CMD_READ, block_number & 0xFF],
+            &[0x01, MIFARE_CMD_READ, block_number],
             1.0
         )?;
 
@@ -477,13 +476,13 @@ trait PN532 {
     /// to write and data should be a byte array of length 4 with the data to
     /// write.  If the data is successfully written then True is returned,
     /// otherwise False is returned.
-    fn mifare_classic_write_block(&self, block_number: u8, data: &[u8]) -> Result<bool> {
+    fn mifare_classic_write_block(&mut self, block_number: u8, data: &[u8]) -> Result<bool> {
         assert_eq!(data.len(), 16);
 
         let mut params = vec![0; 19];
         params[0] = 0x01;
         params[1] = MIFARE_CMD_WRITE;
-        params[2] = block_number & 0xFF;
+        params[2] = block_number;
         params[3..].copy_from_slice(data);
 
         let response = self.call_function(
@@ -496,13 +495,13 @@ trait PN532 {
         self.check_response(response)
     }
 
-    fn ntag2xx_write_block(&self, block_number: u8, data: &[u8]) -> Result<bool> {
+    fn ntag2xx_write_block(&mut self, block_number: u8, data: &[u8]) -> Result<bool> {
         assert_eq!(data.len(), 4);
 
         let mut params = vec![0; 3+data.len()];
         params[0] = 0x01;
         params[1] = MIFARE_ULTRALIGHT_CMD_WRITE;
-        params[2] = block_number & 0xFF;
+        params[2] = block_number;
         params[3..].copy_from_slice(data);
 
         let response = self.call_function(
@@ -515,9 +514,8 @@ trait PN532 {
         self.check_response(response)
     }
     
-    fn ntag2xx_read_block(&self, block_number: u8) -> Result<Vec<u8>>{
-        self.mifare_classic_read_block(block_number)
-            .and_then(| res | {Ok(res[..4].to_owned())})
+    fn ntag2xx_read_block(&mut self, block_number: u8) -> Result<Vec<u8>>{
+        self.mifare_classic_read_block(block_number).map(| res | res[..4].to_owned())
     }
 
     /// Read the state of the PN532's GPIO pins.
@@ -534,7 +532,7 @@ trait PN532 {
     /// P3[7] = 0,     P7[7] = 0,   I[7] = 0,
     /// ```
     /// If `pin` is not None, returns the specified pin state as `(Bool, None)`
-    fn read_gpio(&self, pin: Option<PN532Gpio>) -> Result<(Option<bool>, Option<Vec<u8>>)> {
+    fn read_gpio(&mut self, pin: Option<PN532Gpio>) -> Result<(Option<bool>, Option<Vec<u8>>)> {
         let response = self.call_function(
             COMMAND_READGPIO,
             3,
@@ -571,26 +569,26 @@ trait PN532 {
     /// and P35.
     ///
     /// If p3 and p7 are `None`, set one pin with the params 'pin' and 'state'
-    fn write_gpio(&self, pin: PN532Gpio, state: bool, p3: Option<u8>, p7: Option<u8>) -> Result<()> {
+    fn write_gpio(&mut self, pin: PN532Gpio, state: bool, p3: Option<u8>, p7: Option<u8>) -> Result<()> {
         let mut params = [0x00; 2];
         if let (Some(p3), Some(p7)) = (p3, p7) {
-            params[0] = if p3 == 0 { 0x00 } else { 0x80 | p3 & 0xFF };
-            params[1] = if p7 == 0 { 0x00 } else { 0x80 | p7 & 0xFF };
+            params[0] = if p3 == 0 { 0x00 } else { 0x80 | p3 };
+            params[1] = if p7 == 0 { 0x00 } else { 0x80 | p7 };
             self.call_function(
                 COMMAND_WRITEGPIO,
                 1,
                 &params,
                 1.0
-            ).map(||())
+            ).map(|_|())
         } else {
             match pin {
                 PN532Gpio::I0 | PN532Gpio::I1 => Ok(()),
                 _ => {
                     let response = self.read_gpio(None)?.1.unwrap();
                     params[pin.idx()] = if state {
-                        0x80 | response[pin.idx()] | (1 << pin.offset()) & 0xFF
+                        0x80 | response[pin.idx()] | (1 << pin.offset())
                     } else {
-                        0x80 | response[pin.idx()] & !(1 << pin.offset()) & 0xFF
+                        0x80 | response[pin.idx()] & !(1 << pin.offset())
                     };
 
                     self.call_function(
@@ -598,7 +596,7 @@ trait PN532 {
                         1,
                         &params,
                         1.0
-                    )
+                    ).map(|_| ())
                 }
             }
         }
@@ -623,7 +621,7 @@ trait PN532 {
     /// activated.
     /// :returns initiator_command: an array containing the first valid frame
     /// received by the PN532 once the PN532 has been initialized.
-    fn tg_init_as_target(&self, mode: u8,
+    fn tg_init_as_target(&mut self, mode: u8,
                          mifare_params: [u8; 6], felica_params: [u8; 18], nfcid3t: [u8; 10],
                          gt: Option<&[u8]>, tk: Option<&[u8]>, timeout: f64) -> Result<Option<(u8, Vec<u8>)>> {
         let mut params = Vec::new();
@@ -631,7 +629,7 @@ trait PN532 {
         params.extend_from_slice(&mifare_params);
         params.extend_from_slice(&felica_params);
         params.extend_from_slice(&nfcid3t);
-        let push_slice = | &mut params, slice: Option<&[u8]> | {
+        let push_slice = | params: &mut Vec<u8>, slice: Option<&[u8]> | {
             if let Some(slice) = slice {
                 params.push(slice.len() as u8);
                 params.extend_from_slice(slice);
